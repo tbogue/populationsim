@@ -1,0 +1,801 @@
+import React, { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, ReferenceLine,
+} from "recharts";
+import { Play, ChevronDown, Info } from "lucide-react";
+
+// ---------------------------------------------------------------------------
+// Simulation engine
+// ---------------------------------------------------------------------------
+// Age-structured (Leslie-style) model, one year per time step.
+//
+//  1. Every organism currently within its reproductive age window produces
+//     offspring at the given rate. Births are dampened as the population
+//     nears carrying capacity (logistic-style): actualBirths = potential *
+//     max(0, 1 - population / K).
+//  2. Every existing organism (any age) survives the year at (1 - death
+//     rate) — the same annual death rate applies across all ages.
+//  3. Newborns additionally pass through their first year at a survival
+//     rate shaped by parental-care strategy: precocial young use the death
+//     rate as entered; altricial young carry a modest extra early-life risk
+//     (their survival depends on parental care being sustained).
+function runSimulation(p) {
+  const {
+    ageFirstRepro, reproFrequency, offspringPerEvent, parentalCare,
+    reproductiveSpan, deathRatePct, carryingCapacity, yearsToRun,
+    initialPopulation,
+  } = p;
+
+  const deathRate = Math.min(1, Math.max(0, deathRatePct / 100));
+  const reproEndAge = ageFirstRepro + reproductiveSpan; // exclusive
+  const maxAge = Math.min(500, Math.max(reproEndAge + 40, 60));
+  const altricialPenalty = parentalCare === "altricial" ? 1.25 : 1.0;
+  const offspringSurvivalRate = Math.max(0, Math.min(1, 1 - deathRate * altricialPenalty));
+  const K = carryingCapacity > 0 ? carryingCapacity : Infinity;
+
+  let cohorts = new Array(maxAge).fill(0);
+  cohorts[Math.min(ageFirstRepro, maxAge - 1)] = initialPopulation;
+
+  const summarize = (cohorts, year, births, deaths) => {
+    let juveniles = 0, reproductive = 0, postReproductive = 0, total = 0;
+    for (let age = 0; age < maxAge; age++) {
+      const c = cohorts[age];
+      total += c;
+      if (age < ageFirstRepro) juveniles += c;
+      else if (age < reproEndAge) reproductive += c;
+      else postReproductive += c;
+    }
+    return { year, total, juveniles, reproductive, postReproductive, births, deaths, cohorts: cohorts.slice() };
+  };
+
+  const snapshots = [summarize(cohorts, 0, 0, 0)];
+
+  for (let year = 1; year <= yearsToRun; year++) {
+    const totalBefore = cohorts.reduce((a, b) => a + b, 0);
+    let reproductiveCount = 0;
+    for (let age = ageFirstRepro; age < reproEndAge; age++) reproductiveCount += cohorts[age] || 0;
+
+    const potentialBirths = reproductiveCount * reproFrequency * offspringPerEvent;
+    const capacityFactor = K === Infinity ? 1 : Math.max(0, 1 - totalBefore / K);
+    const births = Math.max(0, Math.round(potentialBirths * capacityFactor));
+
+    const nextCohorts = new Array(maxAge).fill(0);
+    let deaths = 0;
+    for (let age = 0; age < maxAge; age++) {
+      const count = cohorts[age];
+      if (count <= 0) continue;
+      const survivors = Math.round(count * (1 - deathRate));
+      deaths += count - survivors;
+      const newAge = age + 1;
+      nextCohorts[newAge < maxAge ? newAge : maxAge - 1] += survivors;
+    }
+
+    const survivingBirths = Math.round(births * offspringSurvivalRate);
+    deaths += births - survivingBirths;
+    nextCohorts[0] += survivingBirths;
+
+    cohorts = nextCohorts;
+    snapshots.push(summarize(cohorts, year, births, deaths));
+    if (totalBefore === 0 && cohorts.reduce((a, b) => a + b, 0) === 0) {
+      // population is extinct and will remain so — stop early but keep array length predictable by padding
+      for (let y2 = year + 1; y2 <= yearsToRun; y2++) {
+        snapshots.push(summarize(cohorts, y2, 0, 0));
+      }
+      break;
+    }
+  }
+
+  return { snapshots, ageFirstRepro, reproEndAge, maxAge };
+}
+
+// ---------------------------------------------------------------------------
+// Small presentational helpers
+// ---------------------------------------------------------------------------
+const fmt = (n) => Math.round(n).toLocaleString();
+
+function Field({ label, hint, children }) {
+  return (
+    <label className="field">
+      <span className="field-label">{label}</span>
+      {children}
+      {hint && <span className="field-hint">{hint}</span>}
+    </label>
+  );
+}
+
+function NumberInput({ value, onChange, min, max, step = 1, suffix }) {
+  return (
+    <div className="number-input">
+      <input
+        type="number"
+        value={value}
+        min={min}
+        max={max}
+        step={step}
+        onChange={(e) => {
+          const v = e.target.value === "" ? "" : Number(e.target.value);
+          onChange(v);
+        }}
+      />
+      {suffix && <span className="number-suffix">{suffix}</span>}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Habitat view — icon population
+// ---------------------------------------------------------------------------
+function HabitatView({ snapshot, unit }) {
+  const groups = [
+    { key: "juveniles", label: "Juvenile", color: "var(--sage)", n: snapshot.juveniles },
+    { key: "reproductive", label: "Reproductive age", color: "var(--moss)", n: snapshot.reproductive },
+    { key: "postReproductive", label: "Post-reproductive", color: "var(--bark)", n: snapshot.postReproductive },
+  ];
+  const icons = [];
+  groups.forEach((g) => {
+    const count = Math.round(g.n / unit);
+    for (let i = 0; i < count; i++) {
+      icons.push({ id: `${g.key}-${i}`, color: g.color });
+    }
+  });
+
+  return (
+    <div className="habitat">
+      <div className="habitat-icons" aria-label="Simulated population">
+        {icons.length === 0 ? (
+          <div className="habitat-empty">No individuals remain — the population has died out.</div>
+        ) : (
+          icons.map((icon, i) => (
+            <span
+              key={icon.id}
+              className="pop-icon"
+              style={{ background: icon.color, animationDelay: `${(i % 40) * 8}ms` }}
+            />
+          ))
+        )}
+      </div>
+      <div className="habitat-legend">
+        {groups.map((g) => (
+          <div className="legend-item" key={g.key}>
+            <span className="legend-swatch" style={{ background: g.color }} />
+            <span>{g.label}: {fmt(g.n)}</span>
+          </div>
+        ))}
+        {unit > 1 && <div className="legend-note">each icon ≈ {unit} individuals</div>}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Age pyramid
+// ---------------------------------------------------------------------------
+function AgePyramid({ snapshot, ageFirstRepro, reproEndAge, maxAge }) {
+  const bucketSize = Math.max(1, Math.ceil(maxAge / 16));
+  const buckets = [];
+  for (let start = 0; start < maxAge; start += bucketSize) {
+    const end = Math.min(start + bucketSize, maxAge);
+    let sum = 0;
+    for (let a = start; a < end; a++) sum += snapshot.cohorts[a] || 0;
+    let color = "var(--sage)";
+    if (start >= reproEndAge) color = "var(--bark)";
+    else if (start >= ageFirstRepro) color = "var(--moss)";
+    buckets.push({ start, end: end - 1, sum, color });
+  }
+  const max = Math.max(1, ...buckets.map((b) => b.sum));
+
+  return (
+    <div className="pyramid">
+      {buckets.map((b) => (
+        <div className="pyramid-row" key={b.start}>
+          <span className="pyramid-age">{b.start === b.end ? b.start : `${b.start}–${b.end}`}</span>
+          <div className="pyramid-track">
+            <div
+              className="pyramid-bar"
+              style={{ width: `${(b.sum / max) * 100}%`, background: b.color }}
+              title={`${b.sum} individuals`}
+            />
+          </div>
+          <span className="pyramid-count">{fmt(b.sum)}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Main app
+// ---------------------------------------------------------------------------
+const DEFAULT_PARAMS = {
+  initialPopulation: 20,
+  ageFirstRepro: 2,
+  reproFrequency: 1,
+  offspringPerEvent: 3,
+  parentalCare: "precocial",
+  reproductiveSpan: 6,
+  deathRatePct: 20,
+  carryingCapacity: 1000,
+  yearsToRun: 40,
+};
+
+export default function PopulationSimulator() {
+  const [draft, setDraft] = useState(DEFAULT_PARAMS);
+  const [params, setParams] = useState(DEFAULT_PARAMS);
+  const [yearIndex, setYearIndex] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [showTable, setShowTable] = useState(false);
+  const [showNotes, setShowNotes] = useState(false);
+  const [speed, setSpeed] = useState(6); // years per second
+  const intervalRef = useRef(null);
+
+  const result = useMemo(() => runSimulation(params), [params]);
+  const { snapshots, ageFirstRepro, reproEndAge, maxAge } = result;
+  const snapshot = snapshots[Math.min(yearIndex, snapshots.length - 1)];
+
+  const unit = useMemo(() => {
+    const peak = Math.max(...snapshots.map((s) => s.total), params.initialPopulation);
+    return Math.max(1, Math.ceil(peak / 160));
+  }, [snapshots, params.initialPopulation]);
+
+  useEffect(() => {
+    if (!playing) return undefined;
+    intervalRef.current = setInterval(() => {
+      setYearIndex((i) => {
+        if (i >= snapshots.length - 1) {
+          setPlaying(false);
+          return i;
+        }
+        return i + 1;
+      });
+    }, 1000 / speed);
+    return () => clearInterval(intervalRef.current);
+  }, [playing, speed, snapshots.length]);
+
+  const applyParams = useCallback(() => {
+    const cleaned = {
+      initialPopulation: Math.max(1, Math.round(Number(draft.initialPopulation) || 1)),
+      ageFirstRepro: Math.max(0, Math.round(Number(draft.ageFirstRepro) || 0)),
+      reproFrequency: Math.max(0, Number(draft.reproFrequency) || 0),
+      offspringPerEvent: Math.max(0, Number(draft.offspringPerEvent) || 0),
+      parentalCare: draft.parentalCare,
+      reproductiveSpan: Math.max(1, Math.round(Number(draft.reproductiveSpan) || 1)),
+      deathRatePct: Math.min(100, Math.max(0, Number(draft.deathRatePct) || 0)),
+      carryingCapacity: Math.max(0, Math.round(Number(draft.carryingCapacity) || 0)),
+      yearsToRun: Math.min(200, Math.max(1, Math.round(Number(draft.yearsToRun) || 1))),
+    };
+    setParams(cleaned);
+    setDraft(cleaned);
+    setYearIndex(0);
+    setPlaying(true);
+  }, [draft]);
+
+  const growthRate = useMemo(() => {
+    if (yearIndex === 0) return null;
+    const prev = snapshots[yearIndex - 1];
+    if (!prev || prev.total === 0) return null;
+    return ((snapshot.total - prev.total) / prev.total) * 100;
+  }, [yearIndex, snapshots, snapshot]);
+
+  const chartData = useMemo(() => snapshots.map((s) => ({ year: s.year, total: s.total })), [snapshots]);
+  const visibleChartData = chartData.slice(0, yearIndex + 1);
+  const yAxisMax = useMemo(() => {
+    const maxTotal = Math.max(1, ...chartData.map((d) => d.total));
+    const maxCap = params.carryingCapacity > 0 ? params.carryingCapacity : 0;
+    return Math.ceil(Math.max(maxTotal, maxCap) * 1.08);
+  }, [chartData, params.carryingCapacity]);
+
+  return (
+    <div className="pds-root">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
+
+        .pds-root {
+          --ink: #202a1e;
+          --paper: #f1ede0;
+          --paper-deep: #e6dfc9;
+          --moss: #46633c;
+          --sage: #93ab84;
+          --bark: #6b4a2e;
+          --amber: #c98a34;
+          --teal: #2f6e73;
+          --line: #d3cbb0;
+          font-family: 'Inter', sans-serif;
+          background: var(--paper);
+          color: var(--ink);
+          min-height: 100%;
+          padding: 28px;
+          box-sizing: border-box;
+        }
+        .pds-root * { box-sizing: border-box; }
+
+        .pds-header { margin-bottom: 22px; }
+        .pds-title {
+          font-family: 'Fraunces', serif;
+          font-optical-sizing: auto;
+          font-weight: 600;
+          font-size: 30px;
+          margin: 0 0 6px 0;
+          letter-spacing: -0.01em;
+        }
+        .pds-sub {
+          margin: 0;
+          color: #52604a;
+          font-size: 14.5px;
+          max-width: 62ch;
+          line-height: 1.5;
+        }
+
+        .pds-layout {
+          display: grid;
+          grid-template-columns: 300px 1fr;
+          gap: 22px;
+          align-items: start;
+        }
+        @media (max-width: 880px) {
+          .pds-layout { grid-template-columns: 1fr; }
+        }
+
+        .panel {
+          background: var(--paper-deep);
+          border: 1px solid var(--line);
+          border-radius: 10px;
+          padding: 18px;
+        }
+
+        .panel-title {
+          font-family: 'Fraunces', serif;
+          font-weight: 600;
+          font-size: 15px;
+          margin: 0 0 14px 0;
+          color: var(--moss);
+        }
+
+        .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 14px; }
+        .field-label { font-size: 13px; font-weight: 500; color: #3a4534; }
+        .field-hint { font-size: 11.5px; color: #78826c; line-height: 1.35; }
+
+        .number-input {
+          display: flex;
+          align-items: center;
+          background: #faf8f0;
+          border: 1px solid var(--line);
+          border-radius: 6px;
+          padding: 7px 10px;
+        }
+        .number-input input {
+          border: none;
+          background: transparent;
+          outline: none;
+          width: 100%;
+          font-family: 'IBM Plex Mono', monospace;
+          font-size: 13.5px;
+          color: var(--ink);
+        }
+        .number-suffix { font-size: 12px; color: #8a9280; white-space: nowrap; margin-left: 6px; }
+
+        .segmented {
+          display: flex;
+          border: 1px solid var(--line);
+          border-radius: 6px;
+          overflow: hidden;
+        }
+        .segmented button {
+          flex: 1;
+          padding: 8px 6px;
+          border: none;
+          background: #faf8f0;
+          font-size: 12.5px;
+          font-family: 'Inter', sans-serif;
+          color: #5a6350;
+          cursor: pointer;
+        }
+        .segmented button.active { background: var(--moss); color: #f4f2e6; }
+
+        .run-btn {
+          width: 100%;
+          margin-top: 4px;
+          padding: 11px;
+          border: none;
+          border-radius: 7px;
+          background: var(--moss);
+          color: #f4f2e6;
+          font-family: 'Fraunces', serif;
+          font-weight: 600;
+          font-size: 14.5px;
+          cursor: pointer;
+        }
+        .run-btn:hover { background: #395030; }
+        .run-btn:disabled { background: #7c8a71; cursor: default; }
+        .run-btn:disabled:hover { background: #7c8a71; }
+
+        .main-col { display: flex; flex-direction: column; gap: 18px; }
+
+        .transport {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          margin-bottom: 12px;
+          flex-wrap: wrap;
+        }
+        .transport button {
+          border: 1px solid var(--line);
+          background: #faf8f0;
+          border-radius: 6px;
+          width: 34px;
+          height: 34px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          cursor: pointer;
+          color: var(--moss);
+        }
+        .transport button:hover { background: var(--paper-deep); }
+        .transport button.primary { background: var(--moss); color: #f4f2e6; border-color: var(--moss); }
+        .year-readout {
+          font-family: 'IBM Plex Mono', monospace;
+          font-size: 15px;
+          font-weight: 600;
+          min-width: 92px;
+        }
+        .transport input[type="range"] { flex: 1; min-width: 120px; accent-color: var(--moss); }
+        .speed-label { font-size: 12px; color: #78826c; white-space: nowrap; }
+
+        .habitat {
+          background: #faf8f0;
+          border: 1px solid var(--line);
+          border-radius: 10px;
+          padding: 16px;
+          min-height: 210px;
+        }
+        .habitat-icons {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+          min-height: 130px;
+          align-content: flex-start;
+        }
+        .pop-icon {
+          width: 11px;
+          height: 11px;
+          border-radius: 50%;
+          animation: pop-in 260ms ease-out both;
+        }
+        @keyframes pop-in {
+          from { transform: scale(0); opacity: 0; }
+          to { transform: scale(1); opacity: 1; }
+        }
+        .habitat-empty { color: #8a9280; font-size: 13.5px; padding: 30px 0; }
+        .habitat-legend {
+          display: flex;
+          gap: 18px;
+          margin-top: 14px;
+          flex-wrap: wrap;
+          font-size: 12.5px;
+          color: #4a5442;
+          border-top: 1px solid var(--line);
+          padding-top: 10px;
+        }
+        .legend-item { display: flex; align-items: center; gap: 6px; }
+        .legend-swatch { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+        .legend-note { color: #8a9280; font-style: italic; }
+
+        .grid-two {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          gap: 18px;
+        }
+        @media (max-width: 760px) {
+          .grid-two { grid-template-columns: 1fr; }
+        }
+
+        .card {
+          background: #faf8f0;
+          border: 1px solid var(--line);
+          border-radius: 10px;
+          padding: 16px;
+        }
+        .card-title {
+          font-family: 'Fraunces', serif;
+          font-weight: 600;
+          font-size: 14px;
+          margin: 0 0 12px 0;
+          color: var(--moss);
+        }
+
+        .pyramid-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+        .pyramid-age { width: 46px; font-size: 10.5px; color: #78826c; text-align: right; font-family: 'IBM Plex Mono', monospace; }
+        .pyramid-track { flex: 1; background: #efe9d6; border-radius: 3px; height: 12px; overflow: hidden; }
+        .pyramid-bar { height: 100%; border-radius: 3px; transition: width 200ms ease; }
+        .pyramid-count { width: 46px; font-size: 10.5px; color: #5a6350; font-family: 'IBM Plex Mono', monospace; }
+
+        .summary-row {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+          gap: 12px;
+        }
+        .stat-box {
+          background: #faf8f0;
+          border: 1px solid var(--line);
+          border-radius: 10px;
+          padding: 12px 14px;
+        }
+        .stat-label { font-size: 11.5px; color: #78826c; margin-bottom: 4px; }
+        .stat-value {
+          font-family: 'IBM Plex Mono', monospace;
+          font-size: 19px;
+          font-weight: 600;
+          color: var(--ink);
+        }
+        .stat-value.amber { color: var(--amber); }
+        .stat-value.teal { color: var(--teal); }
+
+        .disclosure {
+          background: #faf8f0;
+          border: 1px solid var(--line);
+          border-radius: 10px;
+          overflow: hidden;
+        }
+        .disclosure-head {
+          width: 100%;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          justify-content: space-between;
+          padding: 13px 16px;
+          background: transparent;
+          border: none;
+          cursor: pointer;
+          font-family: 'Fraunces', serif;
+          font-weight: 600;
+          font-size: 14px;
+          color: var(--moss);
+        }
+        .disclosure-body { padding: 0 16px 16px 16px; font-size: 13px; line-height: 1.6; color: #40492f; }
+        .disclosure-body ul { margin: 8px 0; padding-left: 18px; }
+        .chev { transition: transform 160ms ease; }
+        .chev.open { transform: rotate(180deg); }
+
+        table.data-table { width: 100%; border-collapse: collapse; font-size: 12.5px; font-family: 'IBM Plex Mono', monospace; }
+        table.data-table th, table.data-table td { text-align: right; padding: 5px 8px; border-bottom: 1px solid var(--line); }
+        table.data-table th:first-child, table.data-table td:first-child { text-align: left; }
+        table.data-table thead th { color: #78826c; font-weight: 500; font-family: 'Inter', sans-serif; font-size: 11px; }
+        .table-scroll { max-height: 280px; overflow-y: auto; border: 1px solid var(--line); border-radius: 8px; }
+      `}</style>
+
+      <header className="pds-header">
+        <h1 className="pds-title">Population Dynamics Simulator</h1>
+        <p className="pds-sub">
+          Set the life-history traits of an organism and watch how births, deaths, and age
+          structure shape its population over time.
+        </p>
+      </header>
+
+      <div className="pds-layout">
+        <div className="panel">
+          <h2 className="panel-title">Life-history parameters</h2>
+
+          <Field label="Starting population" hint="Individuals present in year 0, all placed at the age of first reproduction.">
+            <NumberInput
+              value={draft.initialPopulation}
+              min={1}
+              onChange={(v) => setDraft((d) => ({ ...d, initialPopulation: v }))}
+              suffix="individuals"
+            />
+          </Field>
+
+          <Field label="Age at first reproduction" hint="Years before an organism can reproduce.">
+            <NumberInput
+              value={draft.ageFirstRepro}
+              min={0}
+              onChange={(v) => setDraft((d) => ({ ...d, ageFirstRepro: v }))}
+              suffix="years"
+            />
+          </Field>
+
+          <Field label="Reproductive events per year" hint="1 = once a year, 0.5 = once every two years.">
+            <NumberInput
+              value={draft.reproFrequency}
+              min={0}
+              step={0.1}
+              onChange={(v) => setDraft((d) => ({ ...d, reproFrequency: v }))}
+            />
+          </Field>
+
+          <Field label="Offspring per reproductive event">
+            <NumberInput
+              value={draft.offspringPerEvent}
+              min={0}
+              onChange={(v) => setDraft((d) => ({ ...d, offspringPerEvent: v }))}
+            />
+          </Field>
+
+          <Field label="Parental care" hint="Altricial young depend on sustained parental care and carry extra early-life risk; precocial young are self-sufficient soon after birth.">
+            <div className="segmented">
+              <button
+                type="button"
+                className={draft.parentalCare === "altricial" ? "active" : ""}
+                onClick={() => setDraft((d) => ({ ...d, parentalCare: "altricial" }))}
+              >
+                Altricial
+              </button>
+              <button
+                type="button"
+                className={draft.parentalCare === "precocial" ? "active" : ""}
+                onClick={() => setDraft((d) => ({ ...d, parentalCare: "precocial" }))}
+              >
+                Precocial
+              </button>
+            </div>
+          </Field>
+
+          <Field label="Reproductive span" hint="How many years an organism keeps reproducing once it starts.">
+            <NumberInput
+              value={draft.reproductiveSpan}
+              min={1}
+              onChange={(v) => setDraft((d) => ({ ...d, reproductiveSpan: v }))}
+              suffix="years"
+            />
+          </Field>
+
+          <Field label="Annual death rate" hint="Applies equally to every age class, offspring included.">
+            <NumberInput
+              value={draft.deathRatePct}
+              min={0}
+              max={100}
+              onChange={(v) => setDraft((d) => ({ ...d, deathRatePct: v }))}
+              suffix="%"
+            />
+          </Field>
+
+          <Field label="Carrying capacity" hint="Births taper off as the population approaches this ceiling.">
+            <NumberInput
+              value={draft.carryingCapacity}
+              min={0}
+              onChange={(v) => setDraft((d) => ({ ...d, carryingCapacity: v }))}
+              suffix="individuals"
+            />
+          </Field>
+
+          <Field label="Years to simulate">
+            <NumberInput
+              value={draft.yearsToRun}
+              min={1}
+              max={200}
+              onChange={(v) => setDraft((d) => ({ ...d, yearsToRun: v }))}
+              suffix="years"
+            />
+          </Field>
+
+          <button className="run-btn" onClick={applyParams} disabled={playing}>
+            <Play size={15} style={{ verticalAlign: -2, marginRight: 7 }} />
+            {playing ? "Running…" : "Run simulation"}
+          </button>
+        </div>
+
+        <div className="main-col">
+          <div className="transport">
+            <span className="year-readout">Year {snapshot.year}</span>
+            <input
+              type="range"
+              min={0}
+              max={snapshots.length - 1}
+              value={yearIndex}
+              onChange={(e) => { setPlaying(false); setYearIndex(Number(e.target.value)); }}
+            />
+            <span className="speed-label">Speed</span>
+            <input
+              type="range"
+              min={1}
+              max={20}
+              value={speed}
+              style={{ flex: "0 0 90px" }}
+              onChange={(e) => setSpeed(Number(e.target.value))}
+            />
+          </div>
+
+          <div className="summary-row">
+            <div className="stat-box">
+              <div className="stat-label">Total population</div>
+              <div className="stat-value">{fmt(snapshot.total)}</div>
+            </div>
+            <div className="stat-box">
+              <div className="stat-label">Births this year</div>
+              <div className="stat-value teal">{fmt(snapshot.births)}</div>
+            </div>
+            <div className="stat-box">
+              <div className="stat-label">Deaths this year</div>
+              <div className="stat-value amber">{fmt(snapshot.deaths)}</div>
+            </div>
+            <div className="stat-box">
+              <div className="stat-label">Year-over-year change</div>
+              <div className="stat-value">{growthRate === null ? "—" : `${growthRate >= 0 ? "+" : ""}${growthRate.toFixed(1)}%`}</div>
+            </div>
+          </div>
+
+          <HabitatView snapshot={snapshot} unit={unit} />
+
+          <div className="grid-two">
+            <div className="card">
+              <h3 className="card-title">Age structure — year {snapshot.year}</h3>
+              <AgePyramid snapshot={snapshot} ageFirstRepro={ageFirstRepro} reproEndAge={reproEndAge} maxAge={maxAge} />
+            </div>
+            <div className="card">
+              <h3 className="card-title">Population over time</h3>
+              <ResponsiveContainer width="100%" height={260}>
+                <LineChart data={visibleChartData} margin={{ top: 4, right: 8, left: -18, bottom: 0 }}>
+                  <CartesianGrid stroke="var(--line)" strokeDasharray="3 3" />
+                  <XAxis
+                    dataKey="year"
+                    type="number"
+                    domain={[0, params.yearsToRun]}
+                    allowDecimals={false}
+                    tick={{ fontSize: 11, fill: "#78826c" }}
+                    label={{ value: "Year", position: "insideBottom", offset: -3, fontSize: 11, fill: "#78826c" }}
+                  />
+                  <YAxis domain={[0, yAxisMax]} tick={{ fontSize: 11, fill: "#78826c" }} />
+                  <Tooltip
+                    contentStyle={{ background: "#faf8f0", border: "1px solid var(--line)", fontSize: 12, fontFamily: "IBM Plex Mono, monospace" }}
+                    formatter={(v) => [fmt(v), "Population"]}
+                    labelFormatter={(y) => `Year ${y}`}
+                  />
+                  {params.carryingCapacity > 0 && (
+                    <ReferenceLine y={params.carryingCapacity} stroke="var(--amber)" strokeDasharray="5 4" label={{ value: "Carrying capacity", position: "insideTopRight", fontSize: 10.5, fill: "var(--amber)" }} />
+                  )}
+                  <Line type="monotone" dataKey="total" stroke="var(--moss)" strokeWidth={2.4} dot={false} isAnimationActive={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </div>
+
+          <div className="disclosure">
+            <button className="disclosure-head" onClick={() => setShowTable((s) => !s)}>
+              <span>Year-by-year data table</span>
+              <ChevronDown size={16} className={`chev ${showTable ? "open" : ""}`} />
+            </button>
+            {showTable && (
+              <div className="disclosure-body">
+                <div className="table-scroll">
+                  <table className="data-table">
+                    <thead>
+                      <tr>
+                        <th>Year</th><th>Total</th><th>Juvenile</th><th>Reproductive</th><th>Post-repro.</th><th>Births</th><th>Deaths</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {snapshots.map((s) => (
+                        <tr key={s.year} style={s.year === snapshot.year ? { background: "#eee6c8" } : undefined}>
+                          <td>{s.year}</td><td>{fmt(s.total)}</td><td>{fmt(s.juveniles)}</td>
+                          <td>{fmt(s.reproductive)}</td><td>{fmt(s.postReproductive)}</td>
+                          <td>{fmt(s.births)}</td><td>{fmt(s.deaths)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+          </div>
+
+          <div className="disclosure">
+            <button className="disclosure-head" onClick={() => setShowNotes((s) => !s)}>
+              <span><Info size={14} style={{ verticalAlign: -2, marginRight: 6 }} />How this model works</span>
+              <ChevronDown size={16} className={`chev ${showNotes ? "open" : ""}`} />
+            </button>
+            {showNotes && (
+              <div className="disclosure-body">
+                <p>Each year the model runs three steps for the whole population at once:</p>
+                <ul>
+                  <li><strong>Reproduce.</strong> Every individual within the reproductive age window contributes offspring = reproductive events/year × offspring per event. As the population approaches carrying capacity, total births are scaled down toward zero (logistic-style dampening) — this is what levels the curve off instead of letting it grow forever.</li>
+                  <li><strong>Survive.</strong> Every existing individual, at any age, survives the year with probability (1 − annual death rate).</li>
+                  <li><strong>Settle in.</strong> Newborns pass through their first year at a survival rate based on parental care: precocial offspring use the death rate as entered; altricial offspring face a modest additional risk, reflecting their dependence on sustained parental care.</li>
+                </ul>
+                <p>The starting population is placed entirely at the age of first reproduction, so births begin immediately in year one. Age tracking runs well past the reproductive span so post-reproductive individuals are still represented until they die of natural mortality.</p>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
